@@ -2,7 +2,7 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -10,20 +10,21 @@ import torch.nn as nn
 from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, Dataset
 
-from model import ModelConfig, build_model
-from dataset.load_dataset import TICKER, YEAR, build_datasets
+from model.model import ModelConfig, build_model
+from dataset.load_dataset import TICKER, YEARS, build_datasets
 
 
-class SequenceDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)
+class Seq2SeqDataset(Dataset):
+    def __init__(self, X_enc: np.ndarray, X_dec: np.ndarray, y_dec: np.ndarray):
+        self.X_enc = torch.tensor(X_enc, dtype=torch.float32)
+        self.X_dec = torch.tensor(X_dec, dtype=torch.float32)
+        self.y_dec = torch.tensor(y_dec, dtype=torch.long)
 
     def __len__(self) -> int:
-        return len(self.X)
+        return len(self.X_enc)
 
     def __getitem__(self, idx: int):
-        return self.X[idx], self.y[idx]
+        return self.X_enc[idx], self.X_dec[idx], self.y_dec[idx]
 
 
 def set_seed(seed: int) -> None:
@@ -33,36 +34,51 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def flatten_logits_targets(
+    logits_seq: torch.Tensor,
+    targets_seq: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    logits_flat = logits_seq.reshape(-1, logits_seq.size(-1))
+    targets_flat = targets_seq.reshape(-1)
+    return logits_flat, targets_flat
+
+
 @torch.no_grad()
-def compute_multiclass_map(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-    probs = torch.softmax(logits, dim=1).cpu().numpy()
-    targets_np = targets.cpu().numpy()
+def compute_multiclass_map(logits_flat: torch.Tensor, targets_flat: torch.Tensor) -> Dict[str, float]:
+    probs = torch.softmax(logits_flat, dim=1).cpu().numpy()
+    targets_np = targets_flat.cpu().numpy()
 
     metrics = {}
     ap_values = []
 
     for cls in range(probs.shape[1]):
         binary_targets = (targets_np == cls).astype(np.int32)
-        ap = average_precision_score(binary_targets, probs[:, cls])
-        metrics[f"class_{cls}_ap"] = float(ap)
-        ap_values.append(float(ap))
 
-    metrics["map"] = float(np.mean(ap_values))
+        if binary_targets.sum() == 0:
+            ap = float("nan")
+        else:
+            ap = float(average_precision_score(binary_targets, probs[:, cls]))
+
+        metrics[f"class_{cls}_ap"] = ap
+        if not np.isnan(ap):
+            ap_values.append(ap)
+
+    metrics["map"] = float(np.mean(ap_values)) if ap_values else float("nan")
     return metrics
 
 
 @torch.no_grad()
-def compute_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-    preds = torch.argmax(logits, dim=1)
+def compute_metrics(logits_flat: torch.Tensor, targets_flat: torch.Tensor) -> Dict[str, float]:
+    preds = torch.argmax(logits_flat, dim=1)
 
-    total = targets.numel()
-    accuracy = (preds == targets).sum().item() / total if total > 0 else 0.0
+    total = targets_flat.numel()
+    accuracy = (preds == targets_flat).sum().item() / total if total > 0 else 0.0
 
     per_class_recall = []
     metrics = {"accuracy": accuracy}
 
     for cls in [0, 1, 2]:
-        cls_mask = targets == cls
+        cls_mask = targets_flat == cls
         pred_mask = preds == cls
 
         n_cls = cls_mask.sum().item()
@@ -77,14 +93,14 @@ def compute_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, fl
         per_class_recall.append(metrics[f"class_{cls}_recall"])
 
     metrics["balanced_accuracy"] = sum(per_class_recall) / 3.0
-    metrics.update(compute_multiclass_map(logits, targets))
+    metrics.update(compute_multiclass_map(logits_flat, targets_flat))
     return metrics
 
 
 class EarlyStopping:
     def __init__(
         self,
-        patience: int = 15,
+        patience: int = 6,
         mode: str = "max",
         min_delta: float = 0.0,
     ):
@@ -111,42 +127,70 @@ class EarlyStopping:
         return self.bad_epochs >= self.patience
 
 
+def format_years(years: Sequence[int]) -> str:
+    years = list(years)
+    if not years:
+        return "none"
+    if len(years) == 1:
+        return str(years[0])
+    return f"{years[0]}-{years[-1]}"
+
+
 def build_dataloaders(
-    seq_len: int = 32,
     batch_size: int = 16,
     ticker: str = TICKER,
-    year: int = YEAR,
+    years: Sequence[int] = YEARS,
     num_workers: int = 0,
-    lam: float = 0.1,
+    lam: float = 0.2,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
     data = build_datasets(
         ticker=ticker,
-        year=year,
-        seq_len=seq_len,
+        years=years,
         lam=lam,
     )
 
-    X_train = data["X_train"]
-    y_train = data["y_train"]
-    X_val = data["X_val"]
-    y_val = data["y_val"]
-    X_test = data["X_test"]
-    y_test = data["y_test"]
+    X_enc_train = data["X_enc_train"]
+    X_dec_train = data["X_dec_train"]
+    y_dec_train = data["y_dec_train"]
 
+    X_enc_val = data["X_enc_val"]
+    X_dec_val = data["X_dec_val"]
+    y_dec_val = data["y_dec_val"]
+
+    X_enc_test = data["X_enc_test"]
+    X_dec_test = data["X_dec_test"]
+    y_dec_test = data["y_dec_test"]
+
+    print("Years:", data["years"])
     print("Input dim:", data["input_dim"])
-    print("X_train:", X_train.shape, "y_train:", y_train.shape)
-    print("X_val:  ", X_val.shape, "y_val:  ", y_val.shape)
-    print("X_test: ", X_test.shape, "y_test: ", y_test.shape)
+    print("Blocks per day:", data["blocks_per_day"])
 
-    print("\nSequence class balance:")
-    for name, y in [("Train", y_train), ("Val", y_val), ("Test", y_test)]:
-        vals, counts = np.unique(y, return_counts=True)
-        ratios = {int(v): float(c / len(y)) for v, c in zip(vals, counts)}
+    print(
+        "X_enc_train:", X_enc_train.shape,
+        "X_dec_train:", X_dec_train.shape,
+        "y_dec_train:", y_dec_train.shape,
+    )
+    print(
+        "X_enc_val:  ", X_enc_val.shape,
+        "X_dec_val:  ", X_dec_val.shape,
+        "y_dec_val:  ", y_dec_val.shape,
+    )
+    print(
+        "X_enc_test: ", X_enc_test.shape,
+        "X_dec_test: ", X_dec_test.shape,
+        "y_dec_test: ", y_dec_test.shape,
+    )
+
+    print("\nDecoder-sequence class balance:")
+    for name, y in [("Train", y_dec_train), ("Val", y_dec_val), ("Test", y_dec_test)]:
+        flat = y.reshape(-1)
+        vals, counts = np.unique(flat, return_counts=True)
+        ratios = {int(v): float(c / len(flat)) for v, c in zip(vals, counts)}
         print(name, ratios)
 
-    train_dataset = SequenceDataset(X_train, y_train)
-    val_dataset = SequenceDataset(X_val, y_val)
-    test_dataset = SequenceDataset(X_test, y_test)
+    train_dataset = Seq2SeqDataset(X_enc_train, X_dec_train, y_dec_train)
+    val_dataset = Seq2SeqDataset(X_enc_val, X_dec_val, y_dec_val)
+    test_dataset = Seq2SeqDataset(X_enc_test, X_dec_test, y_dec_test)
 
     pin_memory = torch.cuda.is_available()
 
@@ -186,35 +230,39 @@ def run_epoch(
     model.train() if is_train else model.eval()
 
     total_loss = 0.0
-    total_samples = 0
+    total_positions = 0
     all_logits = []
     all_targets = []
 
-    for X, y in loader:
-        X = X.to(device)
-        y = y.to(device)
+    for X_enc, X_dec, y_dec in loader:
+        X_enc = X_enc.to(device)
+        X_dec = X_dec.to(device)
+        y_dec = y_dec.to(device)
 
         with torch.set_grad_enabled(is_train):
-            logits = model(X)
-            loss = criterion(logits, y)
+            logits_seq = model(X_enc, X_dec)                    # (B, 13, C)
+            logits_flat, targets_flat = flatten_logits_targets(logits_seq, y_dec)
+
+            loss = criterion(logits_flat, targets_flat)
 
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
-        batch_size = X.size(0)
-        total_loss += loss.item() * batch_size
-        total_samples += batch_size
-        all_logits.append(logits.detach())
-        all_targets.append(y.detach())
+        num_positions = targets_flat.size(0)
+        total_loss += loss.item() * num_positions
+        total_positions += num_positions
+
+        all_logits.append(logits_flat.detach())
+        all_targets.append(targets_flat.detach())
 
     all_logits = torch.cat(all_logits, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
     metrics = compute_metrics(all_logits, all_targets)
-    metrics["loss"] = total_loss / total_samples
+    metrics["loss"] = total_loss / total_positions
     return metrics
 
 
@@ -234,37 +282,34 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="seq2seq_attn",
-        choices=["lstm", "seq2seq_attn", "s2s_attn", "seq2seq_attention"],
+        default="clsa",
+        choices=["lstm", "clsa"],
     )
     parser.add_argument("--ticker", type=str, default=TICKER)
-    parser.add_argument("--year", type=int, default=YEAR)
-
-    parser.add_argument("--seq_len", type=int, default=32)
-    parser.add_argument("--lam", type=float, default=0.1)
+    parser.add_argument("--years", type=int, nargs="+", default=YEARS)
+    parser.add_argument("--lam", type=float, default=0.2)
 
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=64)       # attention MLP size for ConvLSTM model
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--bidirectional", action="store_true")
 
-    parser.add_argument("--use_block_conv", action="store_true")
+    parser.add_argument("--use_block_conv", action="store_true")     # ignored by ConvLSTM model, kept for CLI compatibility
     parser.add_argument("--conv_channels", type=int, default=32)
     parser.add_argument("--conv_kernel_size", type=int, default=3)
-    parser.add_argument("--conv_proj_dim", type=int, default=128)
+    parser.add_argument("--conv_proj_dim", type=int, default=128)    # kept for CLI compatibility
 
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--min_epochs", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument("--min_epochs", type=int, default=8)
     parser.add_argument("--min_delta", type=float, default=0.0)
 
     parser.add_argument(
         "--monitor_metric",
         type=str,
-        default="map",
+        default="balanced_accuracy",
         choices=["loss", "accuracy", "balanced_accuracy", "map"],
     )
 
@@ -292,10 +337,9 @@ def main():
     device = torch.device(args.device)
 
     train_loader, val_loader, test_loader, input_dim = build_dataloaders(
-        seq_len=args.seq_len,
         batch_size=args.batch_size,
         ticker=args.ticker,
-        year=args.year,
+        years=args.years,
         num_workers=args.num_workers,
         lam=args.lam,
     )
@@ -305,7 +349,7 @@ def main():
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        bidirectional=False,  # keep unidirectional for seq2seq
+        bidirectional=False,
         output_dim=3,
         block_rows=5,
         block_cols=6,
@@ -326,21 +370,16 @@ def main():
         min_delta=args.min_delta,
     )
 
+    years_tag = format_years(args.years)
     run_name = (
-        f"{args.model_name}_{args.ticker}_{args.year}"
-        f"_seq{args.seq_len}"
+        f"{args.model_name}_{args.ticker}_{years_tag}"
         f"_lam{args.lam}"
         f"_h{args.hidden_dim}"
         f"_nl{args.num_layers}"
         f"_bs{args.batch_size}"
+        f"_cc{args.conv_channels}"
+        f"_ck{args.conv_kernel_size}"
     )
-    if args.use_block_conv:
-        run_name += (
-            f"_conv"
-            f"_cc{args.conv_channels}"
-            f"_ck{args.conv_kernel_size}"
-            f"_cp{args.conv_proj_dim}"
-        )
 
     save_dir = Path(args.save_dir)
     best_path = save_dir / f"{run_name}_best.pt"
@@ -352,18 +391,13 @@ def main():
 
     print(f"Device: {device}")
     print(f"Model: {args.model_name}")
-    print(f"Ticker: {args.ticker} | Year: {args.year}")
-    print(f"seq_len={args.seq_len} | lam={args.lam}")
+    print(f"Ticker: {args.ticker} | Years: {args.years}")
+    print(f"lam={args.lam}")
     print(
         f"hidden_dim={args.hidden_dim} | num_layers={args.num_layers} "
-        f"| dropout={args.dropout} | use_block_conv={args.use_block_conv}"
+        f"| dropout={args.dropout} | conv_channels={args.conv_channels} "
+        f"| conv_kernel_size={args.conv_kernel_size}"
     )
-    if args.use_block_conv:
-        print(
-            f"conv_channels={args.conv_channels} | "
-            f"conv_kernel_size={args.conv_kernel_size} | "
-            f"conv_proj_dim={args.conv_proj_dim}"
-        )
     print(
         f"batch_size={args.batch_size} | lr={args.lr} | "
         f"monitor_metric={args.monitor_metric}"
@@ -451,6 +485,13 @@ def main():
     )
 
     save_json(history_path, history)
+
+    # right before test evaluation
+    best_ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+
+    print(f"\nLoaded best checkpoint from epoch {best_ckpt['epoch']} "
+        f"with {best_ckpt['monitor_metric']}={best_ckpt['best_metric']:.4f}")
 
     test_metrics = evaluate(
         model,
