@@ -1,0 +1,8 @@
+numpy
+pandas
+torch
+huggingface_hub
+scikit-learn
+matplotlib
+dotenv
+pyarrow
