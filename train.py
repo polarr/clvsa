@@ -13,6 +13,8 @@ from torch.utils.data import DataLoader, Dataset
 from model.model import ModelConfig, build_model
 from dataset.load_dataset import TICKER, YEARS, build_datasets
 
+import model.config
+
 
 class Seq2SeqDataset(Dataset):
     def __init__(self, X_enc: np.ndarray, X_dec: np.ndarray, y_dec: np.ndarray):
