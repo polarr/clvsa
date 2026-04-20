@@ -28,7 +28,6 @@ class LSTMEncoder(nn.Module):
         outputs, (h_n, c_n) = self.lstm(x, hidden)
         return outputs, (h_n, c_n)
 
-
 class RowSharedConvLSTMCell(nn.Module):
     """
     ConvLSTM cell with kernels moving only horizontally across the 6-column axis
