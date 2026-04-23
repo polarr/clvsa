@@ -20,3 +20,5 @@ class ModelConfig:
     # kept for CLI compatibility
     conv_proj_dim: int = 128
     use_block_conv: bool = False
+    
+    #
