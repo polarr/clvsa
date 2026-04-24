@@ -183,6 +183,17 @@ def build_dataloaders(
         "y_dec_test: ", y_dec_test.shape,
     )
 
+    def print_stats(name, x):
+        print(f"{name} global mean/std:", float(x.mean()), float(x.std()))
+
+    print("\nNormalized input stats:")
+    print_stats("X_enc_train", X_enc_train)
+    print_stats("X_dec_train", X_dec_train)
+    print_stats("X_enc_val", X_enc_val)
+    print_stats("X_dec_val", X_dec_val)
+    print_stats("X_enc_test", X_enc_test)
+    print_stats("X_dec_test", X_dec_test)
+
     print("\nDecoder-sequence class balance:")
     for name, y in [("Train", y_dec_train), ("Val", y_dec_val), ("Test", y_dec_test)]:
         flat = y.reshape(-1)
@@ -263,6 +274,13 @@ def run_epoch(
     all_logits = torch.cat(all_logits, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
+    # if not is_train:
+    #     probs = torch.softmax(all_logits, dim=1)
+    #     print("val mean probs:", probs.mean(dim=0).cpu().numpy())
+    #     print("val std probs: ", probs.std(dim=0).cpu().numpy())
+    #     print("val mean logits:", all_logits.mean(dim=0).cpu().numpy())
+    #     print("val std logits: ", all_logits.std(dim=0).cpu().numpy())
+
     metrics = compute_metrics(all_logits, all_targets)
     metrics["loss"] = total_loss / total_positions
     return metrics
@@ -302,8 +320,7 @@ def main():
         block_cols=6,
         conv_channels=args.conv_channels,
         conv_kernel_size=args.conv_kernel_size,
-        conv_proj_dim=args.conv_proj_dim,
-        use_block_conv=args.use_block_conv,
+        use_row_specific_conv=args.use_row_specific_conv
     )
     model = build_model(args.model_name, config).to(device)
 
