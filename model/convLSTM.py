@@ -110,3 +110,99 @@ class RowSharedConvLSTMCell(nn.Module):
         h = h_rows.reshape(b, self.rows, self.hidden_channels, self.cols)
         c = c_rows.reshape(b, self.rows, self.hidden_channels, self.cols)
         return h, c
+
+class RowSpecificConvLSTMCell(nn.Module):
+    """
+    ConvLSTM cell with separate horizontal Conv1d kernels per feature row.
+
+    Input:
+      x: (B, rows, C_in, cols)
+
+    Hidden/state:
+      h, c: (B, rows, C_hidden, cols)
+    """
+    def __init__(
+        self,
+        input_channels: int,
+        hidden_channels: int,
+        kernel_size: int,
+        rows: int,
+        cols: int,
+    ):
+        super().__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.rows = rows
+        self.cols = cols
+
+        padding = kernel_size // 2
+
+        self.conv_x = nn.ModuleList([
+            nn.Conv1d(
+                in_channels=input_channels,
+                out_channels=4 * hidden_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+            )
+            for _ in range(rows)
+        ])
+
+        self.conv_h = nn.ModuleList([
+            nn.Conv1d(
+                in_channels=hidden_channels,
+                out_channels=4 * hidden_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+            )
+            for _ in range(rows)
+        ])
+
+    def init_state(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = torch.zeros(
+            batch_size, self.rows, self.hidden_channels, self.cols,
+            device=device, dtype=dtype,
+        )
+        c = torch.zeros(
+            batch_size, self.rows, self.hidden_channels, self.cols,
+            device=device, dtype=dtype,
+        )
+        return h, c
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h_prev, c_prev = state
+
+        h_rows_out = []
+        c_rows_out = []
+
+        for row_idx in range(self.rows):
+            x_row = x[:, row_idx, :, :]
+            h_row_prev = h_prev[:, row_idx, :, :]   # (B, C_hidden, cols)
+            c_row_prev = c_prev[:, row_idx, :, :]   # (B, C_hidden, cols)
+
+            gates = self.conv_x[row_idx](x_row) + self.conv_h[row_idx](h_row_prev)
+            i, f, o, g = torch.chunk(gates, 4, dim=1)
+
+            i = torch.sigmoid(i)
+            f = torch.sigmoid(f)
+            o = torch.sigmoid(o)
+            g = torch.tanh(g)
+
+            c_row = f * c_row_prev + i * g
+            h_row = o * torch.tanh(c_row)
+
+            h_rows_out.append(h_row.unsqueeze(1))
+            c_rows_out.append(c_row.unsqueeze(1))
+
+        h = torch.cat(h_rows_out, dim=1)
+        c = torch.cat(c_rows_out, dim=1)
+
+        return h, c
