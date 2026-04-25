@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 from typing import Tuple, List
 
@@ -31,8 +32,9 @@ class DotProductSelfAttention(nn.Module):
             prev_refined = torch.stack(prev_refined_states, dim=1)  # (B, t-1, D)
 
             scores = torch.bmm(prev_refined, state_t.unsqueeze(-1)).squeeze(-1)
+            scores = scores / math.sqrt(state_t.size(-1))
             attn_weights = torch.softmax(scores, dim=1)
-            context = torch.sum(prev * attn_weights.unsqueeze(-1), dim=1)
+            context = torch.sum(prev_refined * attn_weights.unsqueeze(-1), dim=1)
 
         refined_state = torch.tanh(self.fuse(torch.cat([state_t, context], dim=-1)))
         return refined_state, attn_weights
@@ -55,6 +57,7 @@ class DotProductInterAttention(nn.Module):
         encoder_outputs: torch.Tensor,  # (B, T_enc, D)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = torch.bmm(encoder_outputs, decoder_state.unsqueeze(-1)).squeeze(-1)
+        scores = scores / math.sqrt(decoder_state.size(-1))
         attn_weights = torch.softmax(scores, dim=1)
         context = torch.sum(encoder_outputs * attn_weights.unsqueeze(-1), dim=1)
         refined_state = torch.tanh(self.fuse(torch.cat([decoder_state, context], dim=-1)))

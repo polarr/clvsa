@@ -96,6 +96,24 @@ def resample_to_5min_regular_session(df: pd.DataFrame) -> pd.DataFrame:
     out["trade_date"] = out["timestamp"].dt.date
     return out
 
+def add_stationary_features(df_5m: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize to log-relative features
+    """
+    df = df_5m.copy()
+
+    df["raw_close"] = df["close"]
+
+    prev_close = df["close"].shift(1)
+
+    df["open"] = np.log(df["open"] / prev_close)
+    df["high"] = np.log(df["high"] / prev_close)
+    df["low"] = np.log(df["low"] / prev_close)
+    df["close"] = np.log(df["close"] / prev_close)
+    df["volume"] = np.log1p(df["volume"])
+
+    df = df.dropna().reset_index(drop=True)
+    return df
 
 def build_day_blocks(
     df_5m: pd.DataFrame,
@@ -131,7 +149,7 @@ def build_day_blocks(
             block = day_df.iloc[i * block_size : (i + 1) * block_size]
             block_2d = block[feature_cols].to_numpy(dtype=np.float32)  # (6, 5), time-major
             blocks_2d.append(block_2d)
-            closes.append(float(block["close"].iloc[-1]))
+            closes.append(float(block["raw_close"].iloc[-1]))
 
         day_records.append(
             {
@@ -152,13 +170,7 @@ def build_day_blocks(
 
 def add_global_ternary_targets(day_records: List[Dict], lam: float = 0.2) -> List[Dict]:
     """
-    Label each 30-minute block using log return between consecutive 30-minute frames
-    across the full chronological series.
-
-    Classes:
-      0 = down
-      1 = flat
-      2 = up
+    Labels classified using Log-return with lam
     """
     global_closes = []
     global_owner_day_idx = []
@@ -204,23 +216,38 @@ def add_global_ternary_targets(day_records: List[Dict], lam: float = 0.2) -> Lis
 
 def split_days_chronologically(
     day_records: List[Dict],
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
+    val_days_count: int = 10,
+    test_days_count: int = 10,
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
-    Split by day first to avoid pair overlap across train/val/test boundaries.
+    Paper-style fixed-duration split.
+
+    For a 3-year dataset:
+      train = all days except final 4 trading weeks
+      val   = next 2 trading weeks
+      test  = final 2 trading weeks
+
+    Approximation:
+      1 trading week = 5 trading days
+      2 trading weeks = 10 trading days
+      4 trading weeks = 20 trading days
     """
     n_days = len(day_records)
-    n_train = int(n_days * train_ratio)
-    n_val = int(n_days * val_ratio)
+    holdout_days = val_days_count + test_days_count
 
-    train_days = day_records[:n_train]
-    val_days = day_records[n_train : n_train + n_val]
-    test_days = day_records[n_train + n_val :]
+    if n_days <= holdout_days + 3:
+        raise ValueError(
+            f"Not enough days for fixed split. "
+            f"Got {n_days}, need more than {holdout_days + 3}."
+        )
+
+    train_days = day_records[:-holdout_days]
+    val_days = day_records[-holdout_days:-test_days_count]
+    test_days = day_records[-test_days_count:]
 
     if min(len(train_days), len(val_days), len(test_days)) < 3:
         raise ValueError(
-            f"Need at least 3 days in each split after splitting. "
+            f"Need at least 3 days in each split. "
             f"Got train={len(train_days)}, val={len(val_days)}, test={len(test_days)}."
         )
 
@@ -340,6 +367,7 @@ def build_datasets(
     local_dir = download_years_of_parquets(years)
     df_1m = load_one_ticker_from_years(local_dir, ticker, years)
     df_5m = resample_to_5min_regular_session(df_1m)
+    df_5m = add_stationary_features(df_5m)
 
     day_records = build_day_blocks(
         df_5m=df_5m,
@@ -351,8 +379,8 @@ def build_datasets(
 
     train_days, val_days, test_days = split_days_chronologically(
         day_records=day_records,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
+        val_days_count=40,
+        test_days_count=40,
     )
 
     scaler = fit_scaler_on_days(train_days)

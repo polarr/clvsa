@@ -13,12 +13,16 @@ class ModelConfig:
     block_rows: int = 5
     block_cols: int = 6
 
-    # paper settings
+    # conv settings
     conv_channels: int = 32
     conv_kernel_size: int = 3
+<<<<<<< HEAD
 
     # kept for CLI compatibility
     conv_proj_dim: int = 128
     use_block_conv: bool = False
     
     #
+=======
+    use_row_specific_conv: bool = False
+>>>>>>> 95b1a481e08db2debbb2fc993127eb89e6a210c9
