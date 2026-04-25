@@ -1,84 +1,80 @@
-from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
-
-from dotenv import load_dotenv
-import os
 
 import numpy as np
 import pandas as pd
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download
 from sklearn.preprocessing import StandardScaler
+from dotenv import load_dotenv
+import os
 
 load_dotenv()
 
-# https://huggingface.co/datasets/mito0o852/OHLCV-1m
-DATASET_REPO = "mito0o852/OHLCV-1m"
+# https://huggingface.co/datasets/ResearchRL/diffquant-data
+DATASET_REPO = "ResearchRL/diffquant-data"
 HF_TOKEN = os.environ.get("HF_TOKEN")
-
-NY_TZ = "America/New_York"
 
 # 5x6 inputs
 BLOCK_SIZE = 6
 
-# 6.5h * 60 / (5 * BLOCK_SIZE) = 13 blocks per day
-BLOCKS_PER_DAY = 13
+# 24h * 60 / (5 * BLOCK_SIZE) = 48 blocks per day
+BLOCKS_PER_DAY = 48
 
-def download_years_of_parquets(years: Sequence[int]) -> str:
-    """
-    Download parquet files for the requested years from the Hugging Face dataset.
-    """
-    allow_patterns = [f"data/ohlcv_{year}-*.parquet" for year in years]
-    local_dir = snapshot_download(
+def download_futures_npz() -> str:
+    return hf_hub_download(
         repo_id=DATASET_REPO,
+        filename="btcusdt_1min_2021_2025.npz",
         repo_type="dataset",
-        allow_patterns=allow_patterns,
-        token=HF_TOKEN,
+        token=HF_TOKEN
     )
-    return local_dir
 
 
-def load_one_ticker_from_years(local_dir: str, ticker: str, years: Sequence[int]) -> pd.DataFrame:
+def load_btcusdt_1m(
+    years: Sequence[int],
+    ticker: str,
+) -> pd.DataFrame:
     """
-    Load all monthly parquet files for the requested years and keep only one ticker.
+    Load BTCUSDT 1-minute perpetual futures.
+
+    Returns:
+      timestamp, open, high, low, close, volume, ticker
     """
-    data_dir = Path(local_dir) / "data"
+    path = download_futures_npz()
+    data = np.load(path, allow_pickle=True)
 
-    files = []
-    for year in years:
-        files.extend(sorted(data_dir.glob(f"ohlcv_{year}-*.parquet")))
+    bars = data["bars"]
+    timestamps = data["timestamps"]
+    columns = list(data["columns"])
 
-    if not files:
-        raise FileNotFoundError(f"No parquet files found for years={list(years)}")
+    df = pd.DataFrame(bars, columns=columns)
+    df["timestamp"] = pd.to_datetime(timestamps, unit="ms", utc=True)
+    df["ticker"] = ticker
 
-    dfs = []
-    for f in files:
-        df = pd.read_parquet(
-            f,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "ticker"],
-        )
-        df = df[df["ticker"] == ticker]
-        if not df.empty:
-            dfs.append(df)
+    df = df[["timestamp", "open", "high", "low", "close", "volume", "ticker"]]
+    df = df.sort_values("timestamp")
+    df = df.drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
 
-    if not dfs:
-        raise ValueError(f"No rows found for ticker={ticker} in years={list(years)}")
+    years = set(years)
+    df = df[df["timestamp"].dt.year.isin(years)].reset_index(drop=True)
 
-    df = pd.concat(dfs, ignore_index=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+    if df.empty:
+        raise ValueError(f"No rows found for years={list(years)}")
+
     return df
 
 
-def resample_to_5min_regular_session(df: pd.DataFrame) -> pd.DataFrame:
+def resample_to_5min_crypto_day(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert 1-minute OHLCV into 5-minute OHLCV, then keep only regular
-    U.S. equity session bars (09:30 to 15:55 New York time).
+    Convert 1-minute BTCUSDT futures bars into 5-minute OHLCV bars.
 
-    Resulting full trading days should have exactly 78 rows:
-      09:30, 09:35, ..., 15:55
+    Unlike the stock loader:
+      - no NYSE market-hours filter
+      - no weekday filter
+      - full UTC crypto days are retained
+
+    Full retained days should have exactly 288 five-minute rows.
     """
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(NY_TZ)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.set_index("timestamp").sort_index()
 
     out = df.resample("5min", label="left", closed="left").agg(
@@ -91,17 +87,17 @@ def resample_to_5min_regular_session(df: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
-    out = out.dropna()
-    out = out.between_time("09:30", "15:55")
-    out = out[out.index.dayofweek < 5]
-
-    out = out.reset_index()
+    out = out.dropna().reset_index()
     out["trade_date"] = out["timestamp"].dt.date
+
     return out
+
 
 def add_stationary_features(df_5m: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize to log-relative features
+    Convert raw OHLCV to stationary-ish log-relative features.
+
+    raw_close is preserved only for label construction.
     """
     df = df_5m.copy()
 
@@ -118,6 +114,7 @@ def add_stationary_features(df_5m: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna().reset_index(drop=True)
     return df
 
+
 def build_day_blocks(
     df_5m: pd.DataFrame,
     feature_cols: List[str],
@@ -125,16 +122,16 @@ def build_day_blocks(
     expected_blocks_per_day: int = BLOCKS_PER_DAY,
 ) -> List[Dict]:
     """
-    Build per-day 30-minute blocks from regular-session 5-minute bars.
+    Build per-day 30-minute blocks from full 24h crypto days.
 
-    Each retained day must have exactly:
-      expected_blocks_per_day * block_size rows
-    For regular U.S. equity hours:
-      BLOCKS_PER_DAY * BLOCK_SIZE = 78 rows
+    Each retained day must have:
+      48 blocks/day * 6 rows/block = 288 five-minute rows
 
-    Each block stores:
-      - block_2d: shape (BLOCK_SIZE, 5), time-major
-      - close: close price of the last 5-minute row in the block
+    Each block has shape:
+      (6, 5)
+
+    After flattening:
+      (5, 6) -> 30 features
     """
     day_records: List[Dict] = []
     expected_rows = block_size * expected_blocks_per_day
@@ -150,8 +147,10 @@ def build_day_blocks(
 
         for i in range(expected_blocks_per_day):
             block = day_df.iloc[i * block_size : (i + 1) * block_size]
-            block_2d = block[feature_cols].to_numpy(dtype=np.float32)  # (BLOCK_SIZE, 5), time-major
+
+            block_2d = block[feature_cols].to_numpy(dtype=np.float32)
             blocks_2d.append(block_2d)
+
             closes.append(float(block["raw_close"].iloc[-1]))
 
         day_records.append(
@@ -164,16 +163,32 @@ def build_day_blocks(
 
     if len(day_records) < 12:
         raise ValueError(
-            f"Not enough full trading days after building 30-minute blocks. "
+            f"Not enough full crypto days after block construction. "
             f"Found only {len(day_records)} full days."
         )
 
     return day_records
 
 
-def add_global_ternary_targets(day_records: List[Dict], lam: float = 0.2) -> List[Dict]:
+def add_global_ternary_targets(
+    day_records: List[Dict],
+    lam: float = 0.001,
+) -> List[Dict]:
     """
-    Labels classified using Log-return with lam
+    Add ternary labels using log-return threshold.
+
+    Important:
+      For futures/crypto, lam is NOT a dollar threshold.
+
+    lam=0.001 means:
+      up   if next block close is > roughly +0.10%
+      down if next block close is < roughly -0.10%
+      flat otherwise
+
+    Classes:
+      0 = down
+      1 = flat
+      2 = up
     """
     global_closes = []
     global_owner_day_idx = []
@@ -189,12 +204,10 @@ def add_global_ternary_targets(day_records: List[Dict], lam: float = 0.2) -> Lis
     next_close = global_closes[1:]
 
     log_ret = np.log(next_close / current_close)
-    b_up = np.log((current_close + lam) / current_close)
-    b_down = np.log((current_close - lam) / current_close)
 
     targets = np.ones(len(log_ret), dtype=np.int64)
-    targets[log_ret > b_up] = 2
-    targets[log_ret < b_down] = 0
+    targets[log_ret > lam] = 2
+    targets[log_ret < -lam] = 0
 
     for day in day_records:
         day["targets"] = []
@@ -210,7 +223,7 @@ def add_global_ternary_targets(day_records: List[Dict], lam: float = 0.2) -> Lis
 
     if len(filtered) < 12:
         raise ValueError(
-            f"Not enough fully labeled trading days after target construction. "
+            f"Not enough fully labeled crypto days after target construction. "
             f"Found only {len(filtered)} labeled days."
         )
 
@@ -219,21 +232,16 @@ def add_global_ternary_targets(day_records: List[Dict], lam: float = 0.2) -> Lis
 
 def split_days_chronologically(
     day_records: List[Dict],
-    val_days_count: int = 10,
-    test_days_count: int = 10,
+    val_days_count: int = 100,
+    test_days_count: int = 100,
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
-    Paper-style fixed-duration split.
+    Chronological fixed holdout split.
 
-    For a 3-year dataset:
-      train = all days except final 4 trading weeks
-      val   = next 2 trading weeks
-      test  = final 2 trading weeks
-
-    Approximation:
-      1 trading week = 5 trading days
-      2 trading weeks = 10 trading days
-      4 trading weeks = 20 trading days
+    Default:
+      final 100 days = test
+      previous 100 days = validation
+      all earlier days = train
     """
     n_days = len(day_records)
     holdout_days = val_days_count + test_days_count
@@ -259,32 +267,36 @@ def split_days_chronologically(
 
 def fit_scaler_on_days(day_records: List[Dict]) -> StandardScaler:
     """
-    Fit feature-wise scaler on all 5-minute rows from training days only.
+    Fit feature-wise scaler on training days only.
     """
     rows = []
+
     for day in day_records:
         for block in day["blocks_2d"]:
             rows.append(block)
 
-    stacked = np.concatenate(rows, axis=0)  # (num_rows, 5)
+    stacked = np.concatenate(rows, axis=0)
 
     scaler = StandardScaler()
     scaler.fit(stacked)
+
     return scaler
 
 
 def flatten_block_feature_major(block_2d: np.ndarray) -> np.ndarray:
     """
-    Convert block from time-major (BLOCK_SIZE, 5) to feature-major flattened vector (30,).
+    Convert block from time-major to feature-major flattened vector.
 
-    Paper-style frame:
-      rows = features
-      cols = BLOCK_SIZE consecutive 5-minute steps
+    Input:
+      (6, 5)
+
+    Output:
+      (30,)
     """
-    if block_2d.shape != (BLOCK_SIZE, 5):
-        raise ValueError(f"Expected block shape (BLOCK_SIZE, 5), got {block_2d.shape}")
+    if block_2d.shape != (6, 5):
+        raise ValueError(f"Expected block shape (6, 5), got {block_2d.shape}")
 
-    block_feature_major = block_2d.T  # (5, BLOCK_SIZE)
+    block_feature_major = block_2d.T
     return block_feature_major.reshape(-1).astype(np.float32)
 
 
@@ -293,7 +305,11 @@ def transform_days(
     scaler: StandardScaler,
 ) -> List[Dict]:
     """
-    Scale each 5-minute row inside each block and flatten each day to shape (BLOCKS_PER_DAY, 30).
+    Scale each 5-minute row inside each block and flatten each block.
+
+    Output per day:
+      blocks_flat: (48, 30)
+      targets:     (48,)
     """
     transformed = []
 
@@ -303,6 +319,7 @@ def transform_days(
 
         for block in day["blocks_2d"]:
             scaled_block = scaler.transform(block).astype(np.float32)
+
             scaled_blocks_2d.append(scaled_block)
             blocks_flat.append(flatten_block_feature_major(scaled_block))
 
@@ -310,8 +327,8 @@ def transform_days(
             {
                 "date": day["date"],
                 "blocks_2d": scaled_blocks_2d,
-                "blocks_flat": np.stack(blocks_flat).astype(np.float32),  # (BLOCKS_PER_DAY, 30)
-                "targets": np.array(day["targets"], dtype=np.int64),      # (BLOCKS_PER_DAY,)
+                "blocks_flat": np.stack(blocks_flat).astype(np.float32),
+                "targets": np.array(day["targets"], dtype=np.int64),
             }
         )
 
@@ -324,11 +341,12 @@ def build_pairs_within_split(
     """
     Build consecutive-day Seq2Seq samples within a split.
 
-    We exclude the final day of the split from pair construction so that the
-    decoder day's final block label does not depend on the next split.
+    X_enc = previous day
+    X_dec = current day
+    y_dec = current day labels
     """
     if len(day_records) < 3:
-        raise ValueError("Need at least 3 days in a split to build safe consecutive-day pairs.")
+        raise ValueError("Need at least 3 days in a split to build consecutive-day pairs.")
 
     usable_days = day_records[:-1]
 
@@ -352,22 +370,24 @@ def build_pairs_within_split(
 def build_datasets(
     ticker: str,
     years: Sequence[int],
-    lam: float = 0.2
+    lam: float = 0.001,
 ) -> Dict[str, np.ndarray]:
     """
-    Build day-paired Seq2Seq datasets.
+    Build futures-style day-paired Seq2Seq datasets.
 
     Output shapes:
-      X_enc_*: (N, BLOCKS_PER_DAY, 30)
-      X_dec_*: (N, BLOCKS_PER_DAY, 30)
-      y_dec_*: (N, BLOCKS_PER_DAY)
+      X_enc_*: (N, 48, 30)
+      X_dec_*: (N, 48, 30)
+      y_dec_*: (N, 48)
+
+    input_dim remains 30 because each 30-minute block is still:
+      5 OHLCV features x 6 five-minute bars
     """
     years = list(years)
     feature_cols = ["open", "high", "low", "close", "volume"]
 
-    local_dir = download_years_of_parquets(years)
-    df_1m = load_one_ticker_from_years(local_dir, ticker, years)
-    df_5m = resample_to_5min_regular_session(df_1m)
+    df_1m = load_btcusdt_1m(years=years, ticker=ticker)
+    df_5m = resample_to_5min_crypto_day(df_1m)
     df_5m = add_stationary_features(df_5m)
 
     day_records = build_day_blocks(
@@ -376,7 +396,11 @@ def build_datasets(
         block_size=BLOCK_SIZE,
         expected_blocks_per_day=BLOCKS_PER_DAY,
     )
-    day_records = add_global_ternary_targets(day_records, lam=lam)
+
+    day_records = add_global_ternary_targets(
+        day_records=day_records,
+        lam=lam,
+    )
 
     train_days, val_days, test_days = split_days_chronologically(
         day_records=day_records,
