@@ -49,11 +49,12 @@ def candle_stick_plot_one_day(dates, df):
         axs[1, i].set_ylabel("Volume")
         axs[1, i].bar(x=x_idx, height=day_df["volume"], color=color)
         
-    fig.suptitle("Two-Consecutive Days of APPL Stocks OHCL")
+    fig.suptitle("Two-Consecutive Days of APPL Stocks OHCLV")
+    plt.savefig("figs/two_day_OHCL_plot.png")
     plt.tight_layout(w_pad=3)
     plt.show()
-    return 
-    
+    return
+
 
 if __name__ == "__main__":
     file_path = "plot_data/APPL_2022.parquet"
