@@ -14,7 +14,7 @@ Note that you may have to change the PyTorch installation if you want to use CUD
 
 Set your `HF_TOKEN` in a `.env` file in the root directory to speed up the dataset download, which could take a few minutes. Note that it will be cached locally after the first download.
 
-To recieve a summary of the dataset, run `python dataset/load_dataset.py`.
+To recieve a summary of the dataset, run `python train.py --dataset_only`.
 
 To train the model, run `python train.py`. You can run it with optional flags to tweak training parameters. Run `python train.py --help` for details.
 

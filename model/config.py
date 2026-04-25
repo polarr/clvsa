@@ -17,3 +17,10 @@ class ModelConfig:
     conv_channels: int = 32
     conv_kernel_size: int = 3
     use_row_specific_conv: bool = False
+
+    # variational settings
+    latent_dim: int = 32 # unspecified in paper
+    prior_fc_dim: int = 512
+    posterior_fc_dim: int = 256
+    alpha: float = 2.5e-4
+    beta_max: float = 1.0

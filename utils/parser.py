@@ -1,20 +1,43 @@
 import argparse
-from dataset.load_dataset import TICKER, YEARS
 import torch
 
+DEFAULTS = {
+    "equity": {
+        "ticker": "AAPL",
+        "years": [2022, 2023, 2024],
+        "lam": 0.2,
+    },
+    "futures": {
+        "ticker": "BTCUSDT",
+        "years": [2022, 2023, 2024],
+        "lam": 0.001,
+    },
+}
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
+        "--dataset_only",
+        action="store_true",
+        help="Only build dataloaders and print dataset summary, don't train model.",
+    )
+    parser.add_argument(
         "--model_name",
         type=str,
-        default="clsa",
-        choices=["lstm", "cls", "clsa", "clsa_inter", "clsa_self", "ls", "lsa", "lsa_inter", "lsa_self"],
+        default="clvsa",
+        choices=["lstm", "cls", "clsa", "clvsa", "clsa_inter", "clsa_self", "ls", "lsa", "lsa_inter", "lsa_self"],
     )
-    parser.add_argument("--ticker", type=str, default=TICKER)
-    parser.add_argument("--years", type=int, nargs="+", default=YEARS)
-    parser.add_argument("--lam", type=float, default=0.2)
+
+    parser.add_argument(
+        "--data_source",
+        type=str,
+        default="futures",
+        choices=["equity", "stock", "futures"],
+    )
+    parser.add_argument("--ticker", type=str, default=None)
+    parser.add_argument("--years", type=int, nargs="+", default=None)
+    parser.add_argument("--lam", type=float, default=None)
 
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--hidden_dim", type=int, default=64)
@@ -29,6 +52,14 @@ def parse_args():
         help="Use separate Conv1d kernels per OHLCV row instead of shared row kernels.",
     )
 
+    parser.add_argument("--latent_dim", type=int, default=32)
+    parser.add_argument("--prior_fc_dim", type=int, default=512)
+    parser.add_argument("--posterior_fc_dim", type=int, default=256)
+
+    parser.add_argument("--alpha", type=float, default=2.5e-4)
+    parser.add_argument("--beta_max", type=float, default=1.0)
+    parser.add_argument("--beta_anneal_epochs", type=int, default=10)
+    
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -59,4 +90,17 @@ def parse_args():
     )
     parser.add_argument("--save_dir", type=str, default="checkpoints")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    defaults = DEFAULTS[args.data_source]
+
+    if args.ticker is None:
+        args.ticker = defaults["ticker"]
+
+    if args.years is None:
+        args.years = defaults["years"]
+
+    if args.lam is None:
+        args.lam = defaults["lam"]
+    
+    return args
