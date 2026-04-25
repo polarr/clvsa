@@ -27,7 +27,8 @@ class BackwardDecoder(CLSADecoder):
 
 '''
 CLVSA Model:
+- Take h_refined_ from CLSADecoder
 '''
 class CLVSAModel():
-    def __init(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig):
         pass
